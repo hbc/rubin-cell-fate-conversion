@@ -1,0 +1,31 @@
+```{r load-libaries}
+library(readr)
+library(dplyr)
+library(tidyr)
+```
+
+
+```{r read-plates}
+plate_reader = function(fn) {
+  batch = strsplit(basename(fn), ".", fixed=TRUE)[[1]][1]
+  data = read.table(fn, header=TRUE, row.names=1)
+  colnames(data) = paste(batch, colnames(data), sep="_")
+  data
+}
+plates_fns = sort(list.files("data", pattern="*.dat", full.names=TRUE))
+plates = do.call(cbind, lapply(plates_fns, plate_reader))
+```
+
+```{r massage-well-identity-data}
+welldata_fn = "metadata/Compound Layout 384w.csv"
+welldata = read_csv(welldata_fn) %>%
+  gather(column, treatment, -row) %>%
+  mutate(well=paste(row, column, sep="")) %>%
+  select(well, treatment)
+identities = data.frame(str_split_fixed(colnames(plates), "_", 3))
+colnames(identities) = c("batch", "drop", "well")
+identities$id = colnames(plates)
+welldata = identities %>% select(batch, well) %>%
+         left_join(welldata, by="well")
+rownames(welldata) = colnames(plates)
+```
