@@ -1,11 +1,27 @@
+---
+  html_document:
+    toc: true
+    highlight: zenburn
+    theme: united
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(tidy=TRUE, highlight=TRUE, dev="png",
+               cache=TRUE, highlight=TRUE, autodep=TRUE, warning=FALSE, error=FALSE,
+               message=FALSE, prompt=TRUE, comment='', fig.cap='')
+```
 ```{r load-libaries}
+library(useful)
 library(readr)
 library(dplyr)
 library(tidyr)
+library(ggplot2)
 ```
 
+Read in the data for each plate into one big dataframe, make unique IDs for
+each batch/well combination and use those IDs as the column names.
 
-```{r read-plates}
+```{r read-plates, eval=!file.exists("plates.RData")}
 plate_reader = function(fn) {
   batch = strsplit(basename(fn), ".", fixed=TRUE)[[1]][1]
   data = read.table(fn, header=TRUE, row.names=1)
@@ -14,18 +30,300 @@ plate_reader = function(fn) {
 }
 plates_fns = sort(list.files("data", pattern="*.dat", full.names=TRUE))
 plates = do.call(cbind, lapply(plates_fns, plate_reader))
+save(plates, file="plates.RData")
 ```
+
+```{r load-plates}
+load("plates.RData")
+```
+
+Create a dataframe of the metadata about each sample. This has an identifier
+for a sample, Which well it came from, which batch and what it was treated with.
 
 ```{r massage-well-identity-data}
 welldata_fn = "metadata/Compound Layout 384w.csv"
 welldata = read_csv(welldata_fn) %>%
   gather(column, treatment, -row) %>%
   mutate(well=paste(row, column, sep="")) %>%
-  select(well, treatment)
+  dplyr::select(well, treatment)
 identities = data.frame(str_split_fixed(colnames(plates), "_", 3))
 colnames(identities) = c("batch", "drop", "well")
 identities$id = colnames(plates)
-welldata = identities %>% select(batch, well) %>%
+welldata = identities %>% dplyr::select(batch, well) %>%
          left_join(welldata, by="well")
 rownames(welldata) = colnames(plates)
+welldata$sample = colnames(plates)
 ```
+
+Verify that the samples match up between the read counts and the metadata dataframe
+and make sure there are no NA counts.
+
+```{r verify-data}
+dim(welldata)
+dim(plates)
+table(rownames(welldata) %in% colnames(plates))
+corner(plates)
+corner(welldata)
+table(complete.cases(plates))
+```
+
+Looks like we are good to go.
+
+Now we will calculate some summary statistics about each sample.
+
+
+```{r plot-genes-detected}
+welldata$genes_detected = colSums(plates > 0)
+welldata$genes_detected_zscore = ave(welldata$genes_detected, FUN=scale)
+welldata$genes_detected_pval = 2 * pnorm(-abs(welldata$genes_detected_zscore))
+welldata$genes_detected_padj = p.adjust(welldata$genes_detected_pval, method="BH")
+outliers = subset(welldata, genes_detected_padj < 0.1)
+ggplot(outliers, aes(treatment, genes_detected, fill=batch)) +
+   geom_bar(stat='identity', position='dodge') +
+   facet_wrap(~batch) +
+   geom_hline(yintercept=ave(welldata$genes_detected), linetype="dashed") +
+   ylab("genes with counts > 0") +
+   xlab("") +
+   theme_bw() +
+   scale_x_discrete(breaks=NULL)
+```
+
+The M2 plate seems to have lower counts than the plates.
+
+```{r low-counts-plate}
+ggplot(welldata, aes(batch, genes_detected)) + geom_boxplot() +
+   ylab("genes with counts > 0") +
+   xlab("") +
+   theme_bw()
+```
+
+We can see it in the boxplot.
+
+```{r boxplot-counts-plate}
+welldata$counts = colSums(plates)
+ggplot(welldata, aes(batch, counts)) + geom_boxplot() +
+   ylab("total counts") +
+   xlab("") +
+   theme_bw()
+```
+
+And the number of failed wells, where we call a well failed if it
+had < 10,000 total counts.
+
+```{r failed-wells}
+welldata$failed = colSums(plates) < 10000
+welldata %>% group_by(batch) %>% summarise(nfailed = sum(failed))
+```
+
+We can also see in an estimate of library complexity that the M2 library
+is less complex than the other libraries.
+
+```{r plot-complexity}
+ggplot(welldata, aes(counts, genes_detected, color=batch)) +
+   geom_smooth(fill=NA) +
+   ylab("genes with counts > 0") +
+   xlab("total counts") +
+   theme_bw()
+```
+
+In this histogram of the genes detected, we can see there are a set of
+samples with a low amount of genes detected.
+
+```{r genes-detected-histogram}
+ggplot(welldata, aes(genes_detected)) + geom_histogram() +
+   theme_bw() + xlab("genes with counts > 0")
+```
+
+Here we drop those samples, using a cutoff of 7,500 genes.
+
+```{r drop-low-genes-detected}
+welldata = subset(welldata, genes_detected > 7500)
+plates = plates[, rownames(welldata)]
+```
+
+```{r biomart-conversions}
+library(biomaRt)
+mouse = useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                dataset="mmusculus_gene_ensembl",
+                host = "jul2015.archive.ensembl.org")
+conversions = getBM(attributes=c("ensembl_gene_id", "mgi_symbol", "gene_biotype"),
+                    mart=mouse)
+```
+
+Samples do not have very many counts in noise genes, so that is not an issue.
+Noise genes are flagged by either being too small to be picked up reliably in a
+standard RNA-seq analysis or are highly variable and prone to introducing
+distortion such as rRNA.
+
+```{r add-noise-counts}
+biotypes = unique(conversions$gene_biotype)
+noise_rna_biotypes = c("Mt_tRNA", "Mt_rRNA", "snoRNA", "snRNA", "misc_RNA",
+                       "scaRNA", "rRNA", "sRNA")
+noise_rna_genes = subset(conversions, gene_biotype %in% noise_rna_biotypes)$mgi_symbol
+noise_rna = rownames(plates)[rownames(plates) %in% noise_rna_genes]
+welldata$noise_counts = colSums(plates[noise_rna,])
+ggplot(welldata, aes(batch, noise_counts)) + geom_boxplot() +
+   ylab("counts in noise genes") +
+   xlab("") +
+   theme_bw()
+```
+
+We'll drop the noise genes from consideration even though there aren't many
+counts in them.
+
+```{r drop-noise-genes}
+plates = plates[!rownames(plates) %in% noise_rna_genes,]
+```
+
+We'll also drop all genes with that don't have at least 100 counts total and
+are not seen in at least 4 samples. This cuts down the number of genes we
+are considering to ~13,500.
+
+```{r drop-low-genes}
+plates = plates[rowSums(plates > 0) > 4 & rowSums(plates) > 100,]
+```
+
+This is what we're left with in terms of samples:
+
+```{r filtering-finish}
+knitr::kable(welldata %>% group_by(batch) %>% summarize(total=n()))
+```
+
+and we're left with `r nrow(plates)` genes to consider.
+
+Here we load the counts into DESeq so we can do PCA. We have to calculate
+the geometric means ourselves because the geometric mean calculation in DESeq
+will fail if there are no genes that have a zero in any row.
+
+```{r load-into-deseq}
+library(DESeq2)
+design = ~batch+treatment
+# get around the geometric mean issue with zero counts
+dds = DESeqDataSetFromMatrix(countData=plates, colData=welldata, design = design)
+geoMeans = apply(plates, 1, function(row) if (all(row == 0)) 0 else
+                 exp(mean(log(row[row != 0]))))
+dds = estimateSizeFactors(dds, geoMeans=geoMeans)
+```
+
+Now we pull out the PCA data so we can color it with metadata about the samples.
+Here we color the samples by genes detected and we can see that there
+is separation along the first component with which plate sample is
+from and along the second component with the number of genes detected.
+
+```{r PCA}
+vst = varianceStabilizingTransformation(dds)
+pca = plotPCA(vst, intgroup=c("batch"), return=TRUE) %>%
+         left_join(welldata, by=c("name" = "sample"))
+ggplot(pca, aes(PC1, PC2, color=genes_detected)) +
+    geom_point(alpha=0.9) +
+    theme_bw() +
+    scale_color_continuous(name="genes detected") +
+    theme(panel.grid.major = element_line(size = .5, color = "grey"),
+          axis.text.x = element_text(angle=90))
+```
+
+The DESeq2 PCA is a little bit limited, it doesn't return the higher order
+principal components and we are going to do t-SNE anyway
+later on, so we'll load these counts into Seurat which has a more flexible
+PCA implementation and also has a t-SNE implementation. We'll first look
+at this data to try to figure out what is up with TCL3.
+
+```{r seurat-setup}
+library(Seurat)
+seurat.raw.data = data.frame(log(plates + 1))
+seurat.data = new('seurat', raw.data=seurat.raw.data)
+seurat.data = setup(seurat.data, project="rubin", min.cells=3, min.genes=1000,
+                    is.expr=1, meta.data=welldata)
+```
+
+Here we look at what are the most variable genes across the samples. We can
+see a lot of these are subunits of ribosomal proteins, these will be used
+for the PCA.
+
+```{r mean-var-plot}
+seurat.data = mean.var.plot(seurat.data, y.cutoff = 2, x.low.cutoff = 2,
+                            fxn.x = expMean,fxn.y = logVarDivMean)
+```
+
+We'll focus on component 1 since that seems to be what separates out
+the TCL3 plate from the other plates.
+
+```{r pca-plot}
+seurat.data = pca(seurat.data, do.print=FALSE)
+pca.plot(seurat.data, 1, 2, pt.size=2)
+pcHeatmap(seurat.data, pc.use = 1, do.balanced = FALSE)
+```
+
+There are quite a few ribosomal proteins that are flagged. These should for the
+most part be stably expressed.
+
+Here we calculated the PCA scores for all genes, not just the most highly
+variable genes and look at the fully projected PCA.
+
+```{r pca-project}
+seurat.data = project.pca(seurat.data, do.print=FALSE)
+pcHeatmap(seurat.data, pc.use = 1, use.full = TRUE, do.balanced = TRUE,
+          remove.key = TRUE)
+```
+
+Here are violin plots of the top few genes. We can see there is a clear
+difference in the TCL3 plate compared to the other plates.
+
+```{r pca-genes-visualize}
+pca1_weighted = seurat.data@pca.x.full[,1:2]
+pca1_weighted = pca1_weighted[order(-abs(pca1_weighted$PC1)),]
+vlnPlot(seurat.data, c(head(rownames(pca1_weighted), 6)))
+```
+
+```{r significant-components}
+seurat.data = jackStraw(seurat.data)
+debug(jackStraw)
+
+```{r higher-elo}
+pca.plot(seurat.data, 5, 6, pt.size=2)
+
+library(scde)
+cd = clean.counts(plates, min.lib.size=1000, min.reads=1, min.detected=1)
+welldata$is_m3 = welldata$batch == "M3"
+sg = welldata$is_m3
+o.ifm = scde.error.models(counts = cd, groups = sg, n.cores = 1,
+                          threshold.segmentation = TRUE,
+                          save.crossfit.plots = FALSE, save.model.plots = FALSE,
+                          verbose = 1)
+
+dds = DESeq(dds)
+res = results(dds, contrast=c("batch", "M3"))
+
+
+write.table(head(rownames(pca1_weighted), 100), quote=FALSE, row.names=FALSE,
+            col.names=FALSE, file="top100PC1.txt")
+
+We'll pull out the top most strongly weighted genes from the PCA and
+write them out to a file.
+
+write.table(head(rownames(x), 50), quote=FALSE, row.names=FALSE, col.names=FALSE,
+ file="top50PC1.txt")
+write.table(rownames(x), quote=FALSE, row.names=FALSE, col.names=FALSE,
+ file="expressed.txt")
+
+
+```{r foo}
+pca.plot(seurat.data, 1, 2, pt.size=2)
+pcHeatmap(seurat.data, pc.use = 1, do.balanced = FALSE)
+```
+
+apoptosis_markers = c("Parp1", "Casp1", "Casp2", "Casp3", "Casp4")
+apoptosis_markers = c(", "Aifm1", "Akt1")
+Abl1	Bcl2	Birc6	Casp2	Cflar	Fas	Lta	Pik3ca	Tnf	Tp53i3
+aifm1	bcl2l11	birc7	casp3	cidea	faslg	ltb	pik3r2	tnfrsf10a	tp73
+AKT1	BCL2L13	BNIP2	CASP4	CIDEB	HIP1	LTBR	PTEN	TNFRSF10B	TRADD
+APAF1	BCL2L2	BNIP3	CASP5	CRADD	HMGB1	MCL1	RELA	TNFRSF10D	TRAF2
+AVEN	BCL3	BNIP3L	CASP6	CYCS	HRK	MYC	RIPK1	TNFRSF1A	TRAF3
+BAD	BCLAF1	BOK	CASP7	DAPK1	HSP90B1	NAIP	RIPK2	TNFRSF1B	TRAF5
+BAG1	BFAR	BRAF	CASP8	DAXX	IGF1R	NFKB1	SOCS2	TNFRSF21	TRAF6
+BAG3	BID	CARD6	CASP8AP2	DEDD	IKBIP	NFKB2	SOCS3	TNFRSF9	TRAF7
+BAG4	BIK	CARD9	CASP9	DEDD2	IKBKB	NFKBIA	STAT1	TNFSF10	XIAP
+BAK1	BIRC2	CASP1	CD27	DFFA	IKBKG	NOD1	STAT5A	TNFSF8
+BAX	BIRC3	CASP10	CD40	DIABLO	IL10	NOL3	STAT5B	TP53
+BCL10	BIRC5	CASP14	CD70	FADD	IL1A	PEA15	TBK1	TP53BP2
+vlnPlot(seurat.data, apoptosis_markers)
