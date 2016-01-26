@@ -234,37 +234,6 @@ knitr::kable(welldata %>% group_by(batch) %>% summarize(total=n()))
 
 and we're left with `r nrow(plates)` genes to consider.
 
-Here we load the counts into DESeq so we can do PCA. We have to calculate
-the geometric means ourselves because the geometric mean calculation in DESeq
-will fail if there are no genes that don't have a zero.
-
-```{r load-into-deseq}
-library(DESeq2)
-design = ~batch+treatment
-# get around the geometric mean issue with zero counts
-dds = DESeqDataSetFromMatrix(countData=plates, colData=welldata, design = design)
-geoMeans = apply(plates, 1, function(row) if (all(row == 0)) 0 else
-                 exp(mean(log(row[row != 0]))))
-dds = estimateSizeFactors(dds, geoMeans=geoMeans)
-```
-
-Now we pull out the PCA data so we can color it with metadata about the samples.
-Here we color the samples by genes detected and we can see that there
-is separation along the first component with which plate sample is
-from and along the second component with the number of genes detected.
-
-```{r PCA}
-vst = varianceStabilizingTransformation(dds)
-pca = plotPCA(vst, intgroup=c("batch"), return=TRUE) %>%
-         left_join(welldata, by=c("name" = "sample"))
-ggplot(pca, aes(PC1, PC2, color=genes_detected)) +
-    geom_point(alpha=0.9) +
-    theme_bw() +
-    scale_color_continuous(name="genes detected") +
-    theme(panel.grid.major = element_line(size = .5, color = "grey"),
-          axis.text.x = element_text(angle=90))
-```
-
 The DESeq2 PCA is a little bit limited, it doesn't return the higher order
 principal components and we are going to do t-SNE anyway
 later on, so we'll load these counts into Seurat which has a more flexible
