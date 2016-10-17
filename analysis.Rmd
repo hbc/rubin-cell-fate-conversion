@@ -17,12 +17,13 @@ library(readr)
 library(dplyr)
 library(tidyr)
 library(ggplot2)
+library(stringr)
 ```
 
 Read in the data for each plate into one big dataframe, make unique IDs for
 each batch/well combination and use those IDs as the column names.
 
-```{r read-plates, eval=!file.exists("plates.RData")}
+```{r read-plates}
 plate_reader = function(fn) {
   batch = strsplit(basename(fn), ".", fixed=TRUE)[[1]][1]
   data = read.table(fn, header=TRUE, row.names=1)
@@ -31,11 +32,6 @@ plate_reader = function(fn) {
 }
 plates_fns = sort(list.files("data", pattern="*.dat", full.names=TRUE))
 plates = do.call(cbind, lapply(plates_fns, plate_reader))
-save(plates, file="plates.RData")
-```
-
-```{r load-plates}
-load("plates.RData")
 ```
 
 Create a dataframe of the metadata about each sample. This has an identifier
@@ -54,6 +50,8 @@ welldata = identities %>% dplyr::select(batch, well) %>%
          left_join(welldata, by="well")
 rownames(welldata) = colnames(plates)
 welldata$sample = colnames(plates)
+welldata$classes = ifelse(welldata$treatment == "DMSO", "DMSO",
+      ifelse(welldata$treatment == "AdMyoD", "AdMyoD", "other"))
 ```
 
 
@@ -90,18 +88,10 @@ welldata$genes_detected = colSums(plates > 0)
 welldata$genes_detected_zscore = ave(welldata$genes_detected, FUN=scale)
 welldata$genes_detected_pval = 2 * pnorm(-abs(welldata$genes_detected_zscore))
 welldata$genes_detected_padj = p.adjust(welldata$genes_detected_pval, method="BH")
-outliers = subset(welldata, genes_detected_padj < 0.1)
-ggplot(outliers, aes(treatment, genes_detected, fill=batch)) +
-   geom_bar(stat='identity', position='dodge') +
-   facet_wrap(~batch) +
-   geom_hline(yintercept=ave(welldata$genes_detected), linetype="dashed") +
-   ylab("genes with counts > 0") +
-   xlab("") +
-   theme_bw() +
-   scale_x_discrete(breaks=NULL)
 ```
 
-The M2 plate seems to have lower counts than the plates.
+We see around 10k genes detected in each cell on each plate, with some cells with
+a low number of genes detected on each plate.
 
 ```{r low-counts-plate}
 ggplot(welldata, aes(batch, genes_detected)) + geom_boxplot() +
@@ -110,8 +100,6 @@ ggplot(welldata, aes(batch, genes_detected)) + geom_boxplot() +
    theme_bw()
 ```
 
-We can see it in the boxplot.
-
 ```{r boxplot-counts-plate}
 welldata$counts = colSums(plates)
 ggplot(welldata, aes(batch, counts)) + geom_boxplot() +
@@ -119,17 +107,6 @@ ggplot(welldata, aes(batch, counts)) + geom_boxplot() +
    xlab("") +
    theme_bw()
 ```
-
-And the number of failed wells, where we call a well failed if it
-had < 10,000 total counts.
-
-```{r failed-wells}
-welldata$failed = colSums(plates) < 10000
-welldata %>% group_by(batch) %>% summarise(nfailed = sum(failed))
-```
-
-We can also see in an estimate of library complexity that the M2 library
-is less complex than the other libraries.
 
 ```{r plot-complexity}
 ggplot(welldata, aes(counts, genes_detected, color=batch)) +
@@ -140,14 +117,15 @@ ggplot(welldata, aes(counts, genes_detected, color=batch)) +
 ```
 
 In this histogram of the genes detected, we can see there are a set of
-samples with a low amount of genes detected.
+cells with a low amount of genes detected, more in the M2 plate than
+the other plates but for the most part the plates look pretty similar.
 
 ```{r genes-detected-histogram}
 ggplot(welldata, aes(genes_detected)) + geom_histogram() +
-   theme_bw() + xlab("genes with counts > 0")
+  theme_bw() + xlab("genes with counts > 0") + facet_wrap(~batch)
 ```
 
-Here we drop those samples, using a cutoff of 7,500 genes.
+Here we drop the cells with less than 7,500 genes detected.
 
 ```{r drop-low-genes-detected}
 welldata = subset(welldata, genes_detected > 7500)
@@ -204,18 +182,12 @@ knitr::kable(welldata %>% group_by(batch) %>% summarize(total=n()))
 
 and we're left with `r nrow(plates)` genes to consider.
 
-The DESeq2 PCA is a little bit limited, it doesn't return the higher order
-principal components and we are going to do t-SNE anyway
-later on, so we'll load these counts into Seurat which has a more flexible
-PCA implementation and also has a t-SNE implementation. We'll first look
-at this data to try to figure out what is up with TCL3.
-
 ```{r seurat-setup}
 library(Seurat)
-seurat.raw.data = data.frame(log(plates + 1))
-seurat.data = new('seurat', raw.data=seurat.raw.data)
-seurat.data = setup(seurat.data, project="rubin", min.cells=1, min.genes=1000,
-                    is.expr=1, meta.data=welldata)
+seurat.data = new('seurat', raw.data=plates)
+seurat.data = Setup(seurat.data, project="rubin", min.cells=3, min.genes=1000,
+                    meta.data=welldata, total.expr=1e4)
+
 ```
 
 Here we look at what are the most variable genes across the samples. We can
@@ -223,187 +195,157 @@ see a lot of these are subunits of ribosomal proteins, these will be used
 for the PCA.
 
 ```{r mean-var-plot}
-seurat.data = mean.var.plot(seurat.data, y.cutoff = 2, x.low.cutoff = 2,
-                            fxn.x = expMean,fxn.y = logVarDivMean)
+seurat.data = MeanVarPlot(seurat.data, y.cutoff = 0.5, x.low.cutoff = 0.0125,
+                          x.high.cutoff=3,
+                          fxn.x = expMean,fxn.y = logVarDivMean)
 ```
 
 We'll focus on component 1 since that seems to be what separates out
-the TCL3 plate from the other plates.
+the batch 3 plate from the other plates.
 
 ```{r pca-plot}
-seurat.data = pca(seurat.data, do.print=FALSE)
-pca.plot(seurat.data, 1, 2, pt.size=2)
-pcHeatmap(seurat.data, pc.use = 1, do.balanced = FALSE)
+seurat.data = PCA(seurat.data, do.print=FALSE)
+PCAPlot(seurat.data, 1, 2, pt.size=2)
+rot = seurat.data@pca.rot %>%
+  tibble::rownames_to_column(var="sample") %>%
+  left_join(welldata, by="sample")
+ggplot(rot, aes(PC1, PC2, shape=classes, color=batch)) +
+  geom_point(size=2) +
+  theme_bw()
 ```
 
 There are quite a few ribosomal proteins that are flagged. These should for the
 most part eithr be stably expressed or are not particularly interesting hits.
 
 Since TCL3 is so different, and it seems different in non-interesting
-ways, let's just drop it for now to make out lives easier.
+ways, let's just drop it for now to make our lives easier. We can see
+that after dropping TCL3 we see a separation of the AdMyoD samples from
+the other samples.
 
 ```{r drop-tcl3}
 welldata = subset(welldata, batch != "M3")
 plates = plates[, rownames(welldata)]
-seurat.raw.data = data.frame(log(plates + 1))
-seurat.data = new('seurat', raw.data=seurat.raw.data)
-seurat.data = setup(seurat.data, project="rubin", min.cells=1, min.genes=1000,
-                    is.expr=1, meta.data=welldata)
-seurat.data = mean.var.plot(seurat.data, y.cutoff = 2, x.low.cutoff = 2,
-                            fxn.x = expMean,fxn.y = logVarDivMean)
-seurat.data = pca(seurat.data, do.print=FALSE)
-pca.plot(seurat.data, 1, 2, pt.size=2)
-seurat.data = project.pca(seurat.data, do.print = FALSE)
-viz.pca(seurat.data, pcs.use = 1:3, num.genes = 10, use.full = TRUE, nCol = 3)
-```
-
-After dropping TCL3 we'll write out all of the gene symbols that are expressed--
-this is a useful background for doing a GO ontology analysis later on.
-
-```{r write-expressed-genes}
-write.table(rownames(plates), file="expressed.txt", quote=FALSE, row.names=FALSE, col.names=FALSE)
-```
-
-To further simplify, lets make this a very simple problem. We want to find
-chemicals that make the samples look more like the Myod treated samples than
-the DMSO alone treated samples. We'll do that by picking out only the
-Myod and DMSO samples, doing PCA and finding the genes most strongly associated
-with whatever component separates out the Myod and DMSO samples.
-
-```{r just-dmso-myod-subset}
-simpledata = subset(welldata, treatment %in% c("DMSO", "AdMyoD"))
-simpledata$sample = rownames(simpledata)
-simple = plates[, rownames(simpledata)]
-simple.raw.data = data.frame(log(simple + 1))
-simple.data = new('seurat', raw.data=simple.raw.data)
-simple.data = setup(simple.data, project="rubin", min.cells=1, min.genes=1000,
-                    is.expr=1, meta.data=simpledata)
-simple.data = mean.var.plot(simple.data, y.cutoff = 2, x.low.cutoff = 2,
-                            fxn.x = expMean,fxn.y = logVarDivMean)
-simple.data = pca(simple.data, do.print=FALSE)
-
-rot = simple.data@pca.rot %>%
-  add_rownames(var="sample")  %>%
-  left_join(simpledata, by="sample")
-```
-
-We can see that PC1 separates out the AdMyoD and DMSO samples and there is
-also an effect of batch along PC2.
-
-```{r pca-just-dmso-myod}
-ggplot(rot, aes(PC1, PC2, shape=treatment, color=batch)) +
-  geom_point(size=4) +
-  theme_bw()
-```
-
-The GO ontology graph of terms enriched for the top 100 genes with the largest
-weights in PC1 makes a lot of sense. This figure is from
-[WebGestalt](http://bioinfo.vanderbilt.edu/webgestalt/) using as a background
-set all expressed genes.
-
-```{r pc1-top-100-genes}
-components = simple.data@pca.x
-components = components[order(-abs(components$PC1)),]
-write.table(head(rownames(components), 100), file="myo-vs-dmso-pc1.txt", quote=FALSE,
-            row.names=FALSE, col.names=FALSE)
-```
-
-![](images/GO-ontology-top-100-AdMyoD-vs-DMSO.gif)
-
-There is also a clear separation along PC2 with some GO enrichment for terms
-involved in differentiation. Here we took just the top 50 because the GO terms
-beyond that had a low weighting in PC2. Could the cells be in different
-states of differentiation from the get-go?
-
-```{r pc2-top-50-genes}
-write.table(head(rownames(components)[order(-abs(components$PC2))], 50),
-            file="myo-vs-dmso-pc2.txt", quote=FALSE, row.names=FALSE, col.names=FALSE)
-```
-
-![](images/GO-ontology-top-50-PC2-AdMyoD-vs-DMSO.gif)
-
-So now we have a set of genes along PC1 that we can use to do PCA with all of
-the chemicals.
-
-```{r original-pca}
-seurat.data = pca(seurat.data, pc.genes=rownames(components))
-welldata$classes = ifelse(welldata$treatment == "DMSO", "DMSO",
-      ifelse(welldata$treatment == "AdMyoD", "AdMyoD", "other"))
+seurat.data = new('seurat', raw.data=plates)
+seurat.data = Setup(seurat.data, project="rubin", min.cells=3, min.genes=200,
+                    total.expr=1e4, meta.data=welldata)
+seurat.data = MeanVarPlot(seurat.data, y.cutoff = 0.5, x.low.cutoff = 0.0125,
+                          x.high.cutoff = 3, do.contour=F,
+                          fxn.x = expMean,fxn.y = logVarDivMean)
+seurat.data = PCA(seurat.data, do.print=FALSE)
+PCAPlot(seurat.data, 1, 2, pt.size=2)
+seurat.data = ProjectPCA(seurat.data, do.print = FALSE)
+VizPCA(seurat.data, pcs.use = 1:3, num.genes = 10, use.full = TRUE, nCol = 3)
 rot = seurat.data@pca.rot %>%
-  add_rownames(var="sample")  %>%
+  tibble::rownames_to_column(var="sample") %>%
   left_join(welldata, by="sample")
-ggplot(rot, aes(PC1, PC2, color=classes, label=treatment)) +
-  geom_point(size=1) +
-  geom_text(size=3) +
-  theme_bw()
-```
-
-Nothing really clusters with Myod, but there might be some chemicals moving
-towards it if we zoom in on the sector closest to the AdMyoD samples:
-
-```{r zoomed-pca}
 ggplot(rot, aes(PC1, PC2, color=batch, label=treatment)) +
-  coord_cartesian(xlim=c(0.00, 0.05), ylim=c(-0.06, 0.05)) +
   geom_text(size=2) +
   theme_bw()
 ```
 
-Repsox, SB43152, CP-673451 and CHIR-124 all look like good hits and there are
-others in there along that front closest to AdMyoD.
+We see there are some chemicals that seem to move the cells towards the AdMyoD
+treated cells. They seem reproducible across the different batches, which is
+great. Zooming in on that area shows some more candidates:
 
-I tried being fancy and projecting to get more genes rather than just looking
-at a hard cutoff for PC1, but it didn't work as well. There might not be
-enough cells to do the jackstraw with these samples, you can see the jackstraw
-plots look weird.
-
-```{r project-all}
-simple.data = project.pca(simple.data, do.print = FALSE)
-projected = simple.data@pca.x.full
-projected = projected[order(-abs(projected$PC1)),]
-
-simple.data = jackStraw(simple.data, num.replicate=1000, prop.freq=0.025)
-jackStrawPlot(simple.data)
-simple.data = project.pca(simple.data, do.print = FALSE,do.center=FALSE)
-genes.sig = pca.sig.genes(simple.data, pcs.use=c(1, 2), pval.cut = 0.001, use.full=TRUE)
-write.table(genes.sig, file="pc1-jackstraw-sig.txt",
-quote=FALSE, row.names=FALSE, col.names=FALSE)
-```
-
-Doing a GO ontology on those genes pulls out some more salient terms.
-
-![](images/GO-ontology-jackstraw-PC1.gif)
-
-So we can try using these genes to do PCA as well.
-
-```{r pca-sig-genes}
-simple.data=pca(simple.data, pc.genes=genes.sig)
-rot = simple.data@pca.rot %>%
-  add_rownames(var="sample")  %>%
-  left_join(simpledata, by="sample")
-ggplot(rot, aes(PC1, PC2, shape=treatment, color=batch)) +
-  geom_point(size=4) +
-  theme_bw()
-```
-
-This improves the look of the PCA, it now separates on the first and
-second principal components. Now if we go back to the original data,
-we can see that Myod treatment separates from the other treatments.
-
-```{r full-pca-sig-genes}
-seurat.data=pca(seurat.data, pc.genes=genes.sig)
-rot = seurat.data@pca.rot %>%
-  add_rownames(var="sample")  %>%
-  left_join(welldata, by="sample")
-ggplot(rot, aes(PC1, PC2, label=treatment, color=batch)) +
-  geom_text(size=2) +
-  theme_bw()
-```
-
-Zooming in, we can maybe pick out a few more chemicals that have an effect.
-
-```{r full-pca-sig-genes-zoomed}
+```{r pca-zoom}
 ggplot(rot, aes(PC1, PC2, color=batch, label=treatment)) +
-  coord_cartesian(xlim=c(-0.075, 0.00), ylim=c(-0.06, 0.05)) +
+  coord_cartesian(xlim=c(-30, 0), ylim=c(-25, 0)) +
   geom_text(size=2) +
   theme_bw()
+```
+
+# Distance to AdMyoD samples
+Here we take a different tactic and find the genes that are most different
+between the AdMyoD samples and the DMSO treated samples. Then we will use those
+genes to measure how far each of the treated samples is from the AdMyoD samples
+in terms of expression of those genes.
+
+```{r admyo-distance-calculation}
+md_samples = rownames(subset(welldata, treatment %in% c("AdMyoD", "DMSO")))
+md_metadata = welldata[md_samples,]
+md_counts = plates[, md_samples]
+```
+
+We fit a model that tests for differences between AdMyoD and DMSO treatment
+while controlling for batch effects.
+
+```{r deseq2-model-fit}
+library(DESeq2)
+dds = DESeqDataSetFromMatrix(countData=md_counts, colData=md_metadata,
+                             design=~batch+treatment)
+dds = DESeq(dds)
+plotDispEsts(dds)
+res = results(dds)
+sig = subset(res, padj < 0.05) %>%
+  data.frame() %>%
+  tibble::rownames_to_column(var="gene") %>%
+  dplyr::arrange(padj)
+```
+
+There are `r nrow(subset(res, padj < 0.05))` genes tagged as differentially
+expressed between the AdMyoD and the DMSO treated samples. We'll use those
+genes to measure how far the chemical treated samples are from the AdMyoD treated
+samples. This gives different results than the PCA method we were using:
+
+```{r euclidean-distance}
+comp1class = welldata[, c("sample", "treatment", "classes")]
+colnames(comp1class) = c("sample", "comp1treat", "comp1class")
+comp2class = welldata[, c("sample", "treatment", "classes")]
+colnames(comp2class) = c("sample", "comp2treat", "comp2class")
+dds = DESeqDataSetFromMatrix(countData=plates, colData=welldata,
+                             design=~batch+treatment)
+dds = estimateSizeFactors(dds)
+ncounts = log(counts(dds, normalized=TRUE) + 1)
+dists = as.matrix(dist(t(ncounts[sig$gene,])))
+dists[diag(dists)] = NA
+dists = dists %>%
+  data.frame() %>%
+  na.omit() %>%
+  tibble::rownames_to_column() %>%
+  tidyr::gather(sample, distance, -rowname)
+colnames(dists) = c("comp1", "comp2", "distance")
+dists = dists %>%
+  left_join(comp1class, by=c("comp1"="sample")) %>%
+  left_join(comp2class, by=c("comp2"="sample")) %>%
+  group_by(comp1treat, comp2treat) %>%
+  summarise(mtreatdist=mean(distance), mtreatsd=sd(distance))
+ggplot(subset(dists, comp1treat == "AdMyoD"),
+       aes(comp2treat, mtreatdist, label=comp2treat)) +
+  geom_text() +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+write_csv(subset(dists, comp1treat == "AdMyoD"), "normalized-count-distance-to-admyod.csv")
+```
+
+## PCA distances
+We can also calculate the distances between points on PC1 and PC2 to get an
+estimate of how similar the samples are to each other:
+
+```{r pca-distances)
+pcamat = as.matrix(rot[, c("PC1", "PC2")])
+rownames(pcamat) = rot$sample
+pcadist = as.matrix(dist(pcamat))
+pcadist[diag(pcadist)] = NA
+pcadist = pcadist %>%
+  data.frame() %>%
+  na.omit() %>%
+  tibble::rownames_to_column() %>%
+  tidyr::gather(sample, distance, -rowname)
+colnames(pcadist) = c("comp1", "comp2", "distance")
+pcadist = pcadist %>%
+  left_join(comp1class, by=c("comp1"="sample")) %>%
+  left_join(comp2class, by=c("comp2"="sample")) %>%
+  group_by(comp1treat, comp2treat) %>%
+  summarise(mtreatdist=mean(distance), mtreatsd=sd(distance))
+myod = subset(pcadist, comp1treat == "AdMyoD") %>%
+  dplyr::arrange(mtreatdist) %>% mutate(rank=dense_rank(mtreatdist))
+ggplot(myod,
+       aes(rank, mtreatdist, label=comp2treat)) +
+  geom_point() +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) +
+  ylab("Euclidean distance to AdMyoD")
+write_csv(myod, "pca-distance-to-admyod.csv")
 ```
